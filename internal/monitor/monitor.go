@@ -2,12 +2,15 @@ package monitor
 
 import (
     "context"
+    "errors"
     "fmt"
     "io"
     "log"
+    "net"
     "os"
     "os/signal"
     "strings"
+    "sync/atomic"
     "syscall"
     "time"
 
@@ -38,6 +41,17 @@ type pathState struct {
     recoverCount int
 }
 
+// dialEvent 记录连接重建事件
+// go-redis 连接池在发现旧连接不健康时会自动创建新连接（触发 DialHook）
+// 通过追踪拨号次数变化，可以感知到连接曾经断开过——即使命令最终执行成功
+type dialEvent struct {
+    count       int64         // 总拨号次数（原子操作）
+    lastTime    time.Time     // 最后一次拨号时间
+    lastErr     error         // 最后一次拨号错误
+    dialCost    time.Duration // 最后一次拨号耗时
+    initialized int64         // 基线是否已建立（0=未建立，1=已建立）
+}
+
 func Run(cfg Config) {
     if cfg.SuccessTimes <= 0 {
         cfg.SuccessTimes = 3
@@ -54,7 +68,7 @@ func Run(cfg Config) {
         defer logFile.Close()
     }
 
-    logger.Printf("启动 Redis-Probe（读写分离统计 | Proxy 架构）")
+    logger.Printf("启动 Redis-Probe（读写分离统计 | Proxy 架构 | 连接重建追踪）")
     logger.Printf("  地址            : %s", cfg.Addr)
     logger.Printf("  用户名          : %s", cfg.Username)
     logger.Printf("  数据库          : %d", cfg.DB)
@@ -67,7 +81,10 @@ func Run(cfg Config) {
     logger.Printf("  心跳日志        : %v", cfg.HeartbeatLog)
     logger.Printf("  日志文件        : %s", cfg.LogFile)
 
-    rdb := newClient(cfg)
+    // 连接重建事件追踪器
+    dialTracker := &dialEvent{}
+
+    rdb := newClient(cfg, dialTracker, logger)
     defer rdb.Close()
 
     ctx, cancel := context.WithCancel(context.Background())
@@ -84,6 +101,24 @@ func Run(cfg Config) {
     writeState := &pathState{name: "写"}
     readState := &pathState{name: "读"}
 
+    // 先建立初始连接，避免首次拨号被误判为"连接重建"
+    // go-redis 默认懒连接，newClient 不会立即拨号
+    // 如果不先 Ping，第一次 checkReadWrite 的拨号会被误判为连接重建
+    pingCtx, pingCancel := context.WithTimeout(context.Background(), cfg.ConnectTimeout)
+    if err := rdb.Ping(pingCtx).Err(); err != nil {
+        logger.Printf("初始连接建立失败: %v（将在探测循环中继续重试）", err)
+    } else {
+        logger.Printf("初始连接建立成功")
+    }
+    pingCancel()
+
+    // 在初始连接建立后采集基线，后续拨号次数增加才意味着连接重建
+    initialDialCount := atomic.LoadInt64(&dialTracker.count)
+    logger.Printf("  初始拨号计数    : %d", initialDialCount)
+
+    // 标记基线已建立，此后 DialHook 的拨号才打印"连接重建"日志
+    atomic.StoreInt64(&dialTracker.initialized, 1)
+
     for {
         select {
         case <-ctx.Done():
@@ -96,10 +131,29 @@ func Run(cfg Config) {
         writeErr, readErr := checkReadWrite(ctx, rdb, cfg.CmdTimeout)
         cost := time.Since(start)
 
+        // 检查连接是否发生了重建
+        // go-redis 连接池在发现旧连接不健康时会自动创建新连接（DialHook 触发）
+        // 这意味着即使命令执行成功，连接也可能曾经断开过
+        currentDialCount := atomic.LoadInt64(&dialTracker.count)
+        if currentDialCount > initialDialCount {
+            rebuildCount := currentDialCount - initialDialCount
+            dialCost := dialTracker.dialCost
+            lastDialErr := dialTracker.lastErr
+            logger.Printf("【连接重建】检测到 %d 次拨号事件 | 最近拨号耗时: %v | 拨号错误: %v",
+                rebuildCount, dialCost, lastDialErr)
+            initialDialCount = currentDialCount
+
+            // 即使当前命令成功了，也记录一次连接重建事件
+            // 因为这证明连接曾经断开过，只是连接池自动恢复了
+            if writeState.isOK && readState.isOK && writeErr == nil && readErr == nil {
+                logger.Printf("【连接重建注意】命令执行成功，但连接发生过重建，存在短暂中断（被连接池自动恢复）")
+            }
+        }
+
         // 连接级严重错误时，主动重建连接
         if writeErr != nil && isConnError(writeErr) || readErr != nil && isConnError(readErr) {
             _ = rdb.Close()
-            rdb = newClient(cfg)
+            rdb = newClient(cfg, dialTracker, logger)
         }
 
         handlePath(logger, writeState, writeErr, cost, cfg)
@@ -163,8 +217,56 @@ func handlePath(logger *log.Logger, st *pathState, err error, cost time.Duration
     }
 }
 
-func newClient(cfg Config) *redis.Client {
-    return redis.NewClient(&redis.Options{
+// connRebuildHook 通过 DialHook 追踪连接重建事件
+// go-redis 的连接池在发现旧连接不健康时会自动调用 Dial 创建新连接
+// 通过 Hook 这个 Dial 过程，我们可以感知到连接曾经断开过
+type connRebuildHook struct {
+    tracker *dialEvent
+    logger  *log.Logger
+}
+
+func (h *connRebuildHook) DialHook(next redis.DialHook) redis.DialHook {
+    return func(ctx context.Context, network, addr string) (net.Conn, error) {
+        count := atomic.AddInt64(&h.tracker.count, 1)
+        dialStart := time.Now()
+
+        conn, err := next(ctx, network, addr)
+        dialCost := time.Since(dialStart)
+
+        h.tracker.lastTime = time.Now()
+        h.tracker.dialCost = dialCost
+        h.tracker.lastErr = err
+
+        if count > 1 {
+            // 只在基线建立后才打印重建日志
+            // 基线建立前的多次拨号是连接池预热（MinIdleConns），不是重建
+            if atomic.LoadInt64(&h.tracker.initialized) == 1 {
+                if err != nil {
+                    h.logger.Printf("【连接重建-失败】第 %d 次拨号 | 耗时: %v | 错误: %v", count, dialCost, err)
+                } else {
+                    h.logger.Printf("【连接重建-成功】第 %d 次拨号 | 耗时: %v", count, dialCost)
+                }
+            }
+        }
+
+        return conn, err
+    }
+}
+
+func (h *connRebuildHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+    return func(ctx context.Context, cmd redis.Cmder) error {
+        return next(ctx, cmd)
+    }
+}
+
+func (h *connRebuildHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+    return func(ctx context.Context, cmds []redis.Cmder) error {
+        return next(ctx, cmds)
+    }
+}
+
+func newClient(cfg Config, dialTracker *dialEvent, logger *log.Logger) *redis.Client {
+    client := redis.NewClient(&redis.Options{
         Addr:         cfg.Addr,
         Username:     cfg.Username,
         Password:     cfg.Password,
@@ -175,7 +277,22 @@ func newClient(cfg Config) *redis.Client {
         MaxRetries:   cfg.MaxRetries,
         PoolSize:     2,
         MinIdleConns: 1,
+        // 关闭拨号重试
+        // 默认 DialerRetries=5, DialerRetryTimeout=100ms
+        // go-redis 在创建新连接失败时会自动重试 5 次（总计约 500ms）
+        // 这会掩盖短暂的中断——拨号失败后重试成功了，探测就看不到错误
+        // 设置为 1 次拨号，不重试，让拨号失败立即暴露
+        DialerRetries:      1,
+        DialerRetryTimeout: 0,
     })
+
+    // DialHook 追踪连接重建
+    client.AddHook(&connRebuildHook{
+        tracker: dialTracker,
+        logger:  logger,
+    })
+
+    return client
 }
 
 // checkReadWrite 分别检测写和读
@@ -189,16 +306,31 @@ func checkReadWrite(ctx context.Context, rdb *redis.Client, timeout time.Duratio
 
     var writeErr, readErr error
 
-    // ---- 写探测 ----
+    // 写探测
     if err := rdb.Set(c, testKey, testVal, 30*time.Second).Err(); err != nil {
         writeErr = fmt.Errorf("SET: %w", err)
     }
 
-    // ---- 读探测 ----
+    // 读探测
     // 即使写失败，也尝试读（可能读的是旧值或从库）
     val, err := rdb.Get(c, testKey).Result()
     if err != nil {
-        readErr = fmt.Errorf("GET: %w", err)
+        // redis.Nil（key 不存在）不是读中断
+        // 当写失败（如 READONLY）时 key 不会被写入，GET 自然返回 redis.Nil
+        // 这说明读路径本身是正常的，只是 key 不存在，不应报读中断
+        if errors.Is(err, redis.Nil) {
+            if writeErr != nil {
+                // 写失败导致 key 不存在，读路径正常，不报读错误
+                readErr = nil
+            } else {
+                // 写成功但 key 不存在，说明读到了旧数据或从库未同步——读异常
+                readErr = fmt.Errorf("GET: key 不存在（写成功但读不到，可能主从延迟）: %w", err)
+            }
+        } else {
+            // 真正的读错误（连接断开、超时等）
+            readErr = fmt.Errorf("GET: %w", err)
+        }
+        // ============================================================
     } else if writeErr == nil && val != testVal {
         // 写成功但读到的值不对，也视为读异常
         readErr = fmt.Errorf("GET 值不匹配 want=%s got=%s", testVal, val)
